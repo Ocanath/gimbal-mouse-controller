@@ -44,7 +44,7 @@ int autoconnect_serial(void)
 		int rc = connect_to_usb_serial(&serialport, namestr, gl_options.baud_rate);
 		if (rc != 0)
 		{
-			if (!(gl_options.csv_header == 1 ))
+			if (!(gl_options.csv_header == 1 && (gl_options.print_only == 1 || gl_options.print_in_parser == 1)))
 			{
 				printf("Connected to COM port %s successfully\n", namestr);
 			}
@@ -59,7 +59,7 @@ int autoconnect_serial(void)
 int serial_write(uint8_t* data, int size)
 {
 	LPDWORD written = 0;
-	int wfrc = WriteFile(&serialport, data, size, written, NULL);
+	int wfrc = WriteFile(serialport, data, size, written, NULL);
 	return (int)written;
 }
 

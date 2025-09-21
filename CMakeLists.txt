@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(rt-plotter-sdl)
+project(gimbal-mouse-controller)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -17,6 +17,7 @@ set(SOURCES
     PPP.cpp
     ppp-parsing.cpp
 	magsensor.cpp
+    sauron-eye-closedform-ik.cpp
 )
 
 set(HEADERS
@@ -27,6 +28,7 @@ set(HEADERS
     ppp-parsing.h
     u32_fmt_t.h
 	magsensor.h
+    sauron-eye-closedform-ik.h
 )
 
 # Platform-specific source files

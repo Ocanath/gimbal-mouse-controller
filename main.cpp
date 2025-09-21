@@ -2,6 +2,12 @@
 #include <stdio.h>
 #include <vector>
 
+// #include<winsock2.h>
+// #include <WS2tcpip.h>
+// #include "WinUdpClient.h"
+
+#include <math.h>
+
 #ifdef PLATFORM_WINDOWS
 #include "winserial.h"
 #elif defined(PLATFORM_LINUX)
@@ -12,8 +18,14 @@
 #include "colors.h"
 #include "args-parsing.h"
 #include <algorithm>
-#include "fsrs.h"
+#include "trig_fixed.h"
+#include "sauron-eye-closedform-ik.h"
 #include "ppp-parsing.h"
+// #pragma comment(lib,"ws2_32.lib") //Winsock Library
+enum { POSITION = 0xFA, TURBO = 0xFB, STEALTH = 0xFC };
+
+#define PAYLOAD_SIZE 512
+#define UNSTUFFING_BUFFER_SIZE (PAYLOAD_SIZE * 2 + 2)
 
 //Screen dimension constants
 const int SCREEN_WIDTH = 1200;
@@ -25,10 +37,46 @@ typedef struct fpoint_t
 	float y;
 }fpoint_t;
 
+static int gl_ppp_bidx = 0;
+static uint8_t gl_ppp_payload_buffer[PAYLOAD_SIZE] = { 0 };	//buffer
+static uint8_t gl_ppp_unstuffing_buffer[UNSTUFFING_BUFFER_SIZE] = { 0 };
+static uint8_t gl_ppp_stuffing_buffer[PAYLOAD_SIZE] = { 0 };
+static uint8_t gl_ser_readbuf[512] = { 0 };
+static float gl_valdump[PAYLOAD_SIZE / sizeof(float)] = { 0 };
+
+
+
+
+/*Value clamping symmetric about zero*/
+int32_t symm_thresh(int32_t sig, int32_t thresh)
+{
+	if (sig > thresh)
+		sig = thresh;
+	if (sig < -thresh)
+		sig = -thresh;
+	return sig;
+}
+
 int main(int argc, char* args[])
 {
 	parse_args(argc, args, &gl_options);
-	autoconnect_serial();
+	autoconnect_serial();//grab a serial port
+
+	// WinUdpClient client(6702);
+	// struct sockaddr_in server;
+	// server.sin_family = AF_INET;
+	// server.sin_addr = in4addr_any;
+	// server.sin_port = htons(6702);
+	// client.set_nonblocking();
+	// client.si_other.sin_family = AF_INET;
+	// //client.si_other.sin_addr.S_un.S_addr = inet_addr("192.168.123.255");
+	// //TODO: auto address discovery with WHO_GOES_THERE
+	// inet_pton(AF_INET, "192.168.137.145", &client.si_other.sin_addr);
+	// sendto(client.s, (const char*)"SPAM_ME", 7, 0, (struct sockaddr*)&client.si_other, client.slen);
+	// bind(client.s, (struct sockaddr*)&server, sizeof(server));
+
+
+
 	//The window we'll be rendering to
 	SDL_Window* window = NULL;
 
@@ -42,310 +90,203 @@ int main(int argc, char* args[])
 	else
 	{
 		//Create window
-		if (gl_options.print_only == 0)
+		window = SDL_CreateWindow("SDL Tutorial", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+		if (window == NULL)
 		{
-			window = SDL_CreateWindow("SDL Tutorial", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
-			if (window == NULL)
-			{
-				printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
-			}
+			printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
 		}
-		
+		else
 		{
-			SDL_Renderer* pRenderer = NULL;
-			if(window != NULL)
-			{
-				pRenderer = SDL_CreateRenderer(window, -1, 0);
-				SDL_SetRenderDrawColor(pRenderer, 255, 255, 255, 255);
-			}
+
 			SDL_Event e; 
 			bool quit = false; 
-			int inc = 0;
-			const int dbufsize = SCREEN_WIDTH*gl_options.num_widths;
-			std::vector<SDL_Point> points(dbufsize);
-			const int numlines = 1;
-			std::vector<std::vector<fpoint_t>> fpoints_lines(numlines, std::vector<fpoint_t>(dbufsize) );
 
-
-			float xscale = 0.f;
 
 			uint64_t start_tick = SDL_GetTicks64();
-			uint8_t serialbuffer[10] = { 0 };
-			int pld_size = 0;
 
+			SDL_SetRelativeMouseMode(SDL_TRUE);
+			int prev_mouse_x = SCREEN_WIDTH / 2;
+			int prev_mouse_y = SCREEN_HEIGHT / 2;
+			int32_t accum_mouse_x = 0;
+			int32_t accum_mouse_y = 0;
+			double forward = 0;
+			const double slow_speedcap = 200;
+			const double fast_speedcap = 3000;
+			double velocity_threshold = slow_speedcap;
+			double th1 = 0;
+			double th2 = 0;
 
-			int wordsize = 0;
-			int previous_wordsize = 0;
-			int wordsize_match_count = 0;
-			int cycle_count_for_printing = 0;
-			uint32_t view_size = 0;
-			int gl_selected_channel = 0;
-			int number_of_frames_buffered = 0;
-			uint64_t new_pkt_received_ts = 0;
-			uint8_t timeout_occurred = 0;
+			SDL_WarpMouseInWindow(window, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+
+			const int num_keys = 322;
+			bool keys[num_keys];  // 322 is the number of SDLK_DOWN events
+
+			for (int i = 0; i < num_keys; i++) { // init them all to false
+				keys[i] = false;
+			}
+
+			int32_t delta = 0;
+			uint64_t ms_ts = 0;
+
+			uint64_t w_ts = 0;
+			uint64_t s_ts = 0;
+			uint64_t w_stop_ts = 0;
+			uint64_t s_stop_ts = 0;
+			bool w_pressed_prev = false;
+			bool s_pressed_prev = false;
+			int zerocount = 0;
+			uint64_t mouse_activity_ts = 0;
+			uint64_t print_ts = 0;
+			uint64_t udp_tx_ts = 0;
+			int32_t deltax_lastvalid = 0;
+			uint8_t throttle = 0;
+			uint8_t prev_throttle = 0;
+			uint64_t throttle_stop_ts = 0;
+			double targx = 0;
+			double targy = 0;
 			while (quit == false) 
 			{
 				uint64_t tick = SDL_GetTicks64() - start_tick;
+				if (tick - ms_ts > 0)
+				{
+					delta = (int32_t)(tick - ms_ts);
+					ms_ts = tick;
+				}
 				float t = ((float)tick) * 0.001f;
-				if(pRenderer != NULL)
-				{
-					SDL_SetRenderDrawColor(pRenderer, bgColor.r, bgColor.g, bgColor.b, bgColor.a);
-					SDL_RenderClear(pRenderer);
-				}
 
-				uint8_t new_pkt = 0;
-				if (gl_options.write_dummy_loopback)
-				{
-					write_dummy_loopback(SDL_GetTicks64());
-				}
-
-				
-				pld_size = 0;
-				int num_bytes_read = read_serial(gl_ser_readbuf, sizeof(gl_ser_readbuf));				
-				for (int i = 0; i < (int)num_bytes_read; i++)
-				{
-					uint8_t new_byte = gl_ser_readbuf[i];
-					pld_size = parse_PPP_stream(new_byte, gl_ppp_payload_buffer, PAYLOAD_SIZE, gl_ppp_unstuffing_buffer, UNSTUFFING_BUFFER_SIZE, &gl_ppp_bidx);
-					if (pld_size > 0)
-					{
-
-						if (gl_options.offaxis_encoder)
-						{
-							parse_PPP_offaxis_encoder(gl_ppp_payload_buffer, pld_size, gl_valdump, &wordsize, SDL_GetTicks64());
-							new_pkt = 1;
-						}
-						else if (gl_options.temp_sensor)
-						{
-							parse_PPP_tempsensor(gl_ppp_payload_buffer, pld_size, gl_valdump, &wordsize);
-							new_pkt = 1;
-						}
-						else if (gl_options.fsr_sensor)
-						{
-							parse_PPP_fsr_sensor(gl_ppp_payload_buffer, pld_size, gl_valdump, &wordsize, SDL_GetTicks64());
-							new_pkt = 1;
-						}
-						else
-						{
-							if (gl_options.xy_mode == 0)
-							{
-								parse_PPP_values(gl_ppp_payload_buffer, pld_size, gl_valdump, &wordsize);
-								new_pkt = 1;
-							}
-							else
-							{
-								parse_PPP_values_noscale(gl_ppp_payload_buffer, pld_size, gl_valdump, &wordsize);
-								new_pkt = 1;
-							}
-						}
-
-						//obtain consecutive matching counts
-						if (wordsize == previous_wordsize && wordsize > 0)
-						{
-							wordsize_match_count++;
-							if (gl_options.print_vals || gl_options.print_only)
-							{
-								cycle_count_for_printing = (cycle_count_for_printing + 1) % gl_options.print_in_parser_every_n;
-								if (cycle_count_for_printing == 0)
-								{
-									for (int fvidx = 0; fvidx < wordsize-1; fvidx++)
-									{
-										float val = gl_valdump[fvidx] * gl_options.parser_yscale;
-										printf("%0.6f, ", val);
-									}
-									printf("%0.6f\n", gl_valdump[wordsize - 1]);	//time is always in ms coming in, so no scaling with yscale here
-								}
-							}
-						}
-						else
-						{
-							wordsize_match_count = 0;
-						}
-						previous_wordsize = wordsize;
-					}
-				}
-
-				if (gl_options.print_only == 0)
-				{
-					//resize action
-					if (wordsize_match_count >= 100)
-					{
-						int num_lines = 0;
-						if (gl_options.xy_mode == 0)
-						{
-							num_lines = (wordsize - 1);
-						}
-						else
-						{
-							num_lines = wordsize / 2;
-						}
-						if (fpoints_lines.size() != num_lines)
-						{
-							fpoints_lines.resize(num_lines, std::vector<fpoint_t>(dbufsize));
-							for (int line = 0; line < num_lines; line++)
-							{
-								for (int vidx = 0; vidx < dbufsize; vidx++)
-								{
-									fpoints_lines[line][vidx].x = 0;
-									fpoints_lines[line][vidx].y = 0;
-								}
-							}
-							number_of_frames_buffered = 0;
-						}
-
-					}
-					{
-						uint64_t time_since_last_new_packet = (tick - new_pkt_received_ts);
-						if (time_since_last_new_packet > 400)
-						{
-							timeout_occurred = 1;
-						}
-						if (timeout_occurred != 0 && time_since_last_new_packet < 100)
-						{
-							timeout_occurred = 0;
-							number_of_frames_buffered = 0;
-						}
-					}
-
-					if(new_pkt)
-					{
-						number_of_frames_buffered++;	//maximum value is dbufsize
-						if (number_of_frames_buffered >= dbufsize)
-						{
-							number_of_frames_buffered = dbufsize - 1;
-						}
-						new_pkt_received_ts = tick;
-					}
-
-					int last_idx = dbufsize - 1;	//most recent value
-					int begin_idx = dbufsize - number_of_frames_buffered;
-					//sanity bounds check. When the number of buffered frames is zero the above math would overrun
-					if (begin_idx > last_idx)
-						begin_idx = last_idx;
-					if (begin_idx < 0)
-						begin_idx = 0;
-
-					for (int line = 0; line < fpoints_lines.size(); line++)
-					{	
-						if(pRenderer != NULL)
-							SDL_SetRenderDrawColor(pRenderer, template_colors[line % NUM_COLORS].r, template_colors[line % NUM_COLORS].g, template_colors[line % NUM_COLORS].b, 255);
-
-						//retrieve and load all available datapoints here
-						std::vector<fpoint_t>* pFpoints = &fpoints_lines[line];
-
-						if (new_pkt)
-						{
-							float x, y;
-							if (gl_options.xy_mode == 0)
-							{
-								/*Parsing and loading done HERE.
-								* if there is a more complex parsing function, implement it elsewhere and have it return X and Y.
-								*
-								* It should be a function whose input is the unstuffed PPP buffer and whose output is x and y of each line contained in the buffer payload
-								*/
-								x = gl_valdump[fpoints_lines.size()];
-								y = gl_valdump[line];
-							}
-							else
-							{
-								x = gl_valdump[line * 2];
-								y = gl_valdump[(line * 2) + 1];
-							}
-
-							std::rotate(pFpoints->begin(), pFpoints->begin() + 1, pFpoints->end());
-							(*pFpoints)[dbufsize - 1].x = x;
-							(*pFpoints)[dbufsize - 1].y = y;
-						}
-
-						float div_pixel_size = 0;
-						float div_center = 0;
-						if(gl_options.spread_lines)
-							div_pixel_size = (float)SCREEN_HEIGHT / ((float)fpoints_lines.size());
-						else
-						{
-							div_center = (float)SCREEN_HEIGHT / 2;
-						}
-
-						if (line == 0)
-						{
-							if (gl_options.xy_mode == 0)
-							{
-								float div = (fpoints_lines[0][last_idx].x - fpoints_lines[0][begin_idx].x);
-								if (div > 0)
-									xscale = ((float)SCREEN_WIDTH) / div;
-							}
-						}
-
-						for (int i = begin_idx; i < dbufsize; i++)
-						{
-							if (gl_options.spread_lines)
-							{
-								div_center = (div_pixel_size * line) + (div_pixel_size * .5f);	//calculate the center point of the line we're drawing on screen
-							}
-							if (gl_options.xy_mode == 0)
-							{
-								points[i].x = (int)(((*pFpoints)[i].x - (*pFpoints)[begin_idx].x) * xscale);
-								points[i].y = SCREEN_HEIGHT - ((int)((*pFpoints)[i].y * gl_options.yscale) + div_center);
-							}
-							else
-							{
-								points[i].x = (int)(((*pFpoints)[i].x) * gl_options.yscale) + SCREEN_WIDTH /  2;
-								points[i].y = (-(int)((*pFpoints)[i].y * gl_options.yscale)) + SCREEN_HEIGHT / 2;	//apply uniform scaling
-							}
-						}
-						if (pRenderer != NULL)
-							SDL_RenderDrawLines(pRenderer, (SDL_Point*)(&points[begin_idx]), dbufsize-begin_idx);
-					}
-					if (pRenderer != NULL)
-						SDL_RenderPresent(pRenderer);				
-				}
+				uint8_t mouse_motion = 0;
 				SDL_PollEvent(&e);
 				{
 					if (e.type == SDL_QUIT)
 						quit = true;
-					else if (e.type == SDL_KEYDOWN)
+					else if (e.type == SDL_MOUSEMOTION)
 					{
-						int keyval = (int)e.key.keysym.sym;
+						mouse_motion = 1;
+						mouse_activity_ts = tick;
 					}
-					else if (e.type == SDL_KEYUP)
-					{
-						int keyval = (int)e.key.keysym.sym;
-						if (keyval == SDLK_UP)
-						{
-							gl_selected_channel = (gl_selected_channel + 1) % NUM_FSR_PER_FINGER;
-						}
-						if (keyval == SDLK_DOWN)
-						{
-							gl_selected_channel = (gl_selected_channel - 1) % NUM_FSR_PER_FINGER;
-							if (gl_selected_channel < 0)
-								gl_selected_channel = NUM_FSR_PER_FINGER + gl_selected_channel;
-						}
-					}
-
 				}
 
-			}
+				int mouse_x, mouse_y;
+				uint32_t bts = SDL_GetMouseState(&mouse_x, &mouse_y);
+				int32_t gain_x = 1;
+				int32_t gain_y = -1;
+				int32_t deltax = (mouse_x - prev_mouse_x)* gain_x;
+				int32_t deltay = (mouse_y - prev_mouse_y) * gain_y;
 
-			//erase all the buffers
-			for (int i = 0; i < fpoints_lines.size(); i++)
-			{
-				fpoints_lines[i].clear();
+				accum_mouse_x = ( (accum_mouse_x + deltax) );
+				accum_mouse_y = ( ( accum_mouse_y + deltay) );
+				
+				if (mouse_motion != 0 || (tick - mouse_activity_ts) > 10)
+				{
+					deltax_lastvalid = deltax;
+				}
+
+
+
+				double kbvx = -(double)accum_mouse_x / 1000.;
+				double kbvy = (double)accum_mouse_y / 1000.;
+
+				double vx = kbvx;
+				double vy = kbvy;
+				if (bts == 1)	//left mouse button
+				{
+					vx = targx;
+					vy = targy;
+				}
+				if (bts == 2)	//center mouse button
+				{
+					targx = vx;
+					targy = vy;
+				}
+
+				//double tsec = double(tick) / 1000;
+				//double vx = sin(tsec)*0.5;
+				//double vy = cos(tsec)*0.5;
+
+				//double vx = 0;
+				//double vy = 0;
+				//uint32_t tmod = tick % 4000;
+				//
+				//if (tmod >= 0 && tmod < 1000)
+				//{
+				//	double tmodsec = (double)(tmod - 0) / 1000.;
+				//	vx = tmodsec*10;
+				//	vy = 0;
+				//}
+				//else if (tmod >= 1000 && tmod < 2000)
+				//{
+				//	double tmodsec = (double)(tmod - 1000) / 1000.;
+				//	vx = 10;
+				//	vy = tmodsec * 10;
+				//}
+				//else if (tmod >= 2000 && tmod < 3000)
+				//{
+				//	double tmodsec = (double)(tmod - 2000) / 1000.;
+				//	vx = 10 - tmodsec * 10;
+				//	vy = 10;
+				//}
+				//else if (tmod >= 3000 && tmod < 4000)
+				//{
+				//	double tmodsec = (double)(tmod - 3000) / 1000.;
+				//	vy = 10 - tmodsec * 10;
+				//	vx = 0;
+				//}
+				//vx = vx + kbvx;
+				//vy = vy + kbvy;
+
+				const double rotangle = M_PI / 4;
+				double vxr = vx * cos(rotangle) - vy * sin(rotangle);
+				double vyr = vx * sin(rotangle) + vy * cos(rotangle);
+				get_ik_angles_double(vxr, vyr, 10, &th1, &th2);
+				int32_t th1_i32 = (int32_t)(th1 * (float)PI_14B);
+				int32_t th2_i32 = (int32_t)(th2 * (float)PI_14B);
+
+				if ( (tick - print_ts) > 50)
+				{
+					printf("%f, %f, %d, %d, %d\n", vx, vy, th1_i32, th2_i32, bts);
+					print_ts = tick;
+				}
+
+				SDL_WarpMouseInWindow(window, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+
+
+				if (tick - udp_tx_ts > 10)
+				{
+					udp_tx_ts = tick;
+
+					uint8_t pld[32] = { 0 };
+					uint16_t* pu16 = (uint16_t*)(&pld[0]);
+					int i = 0;
+					pld[i++] = POSITION;
+					pld[i++] = 0;
+
+					int32_t* p_cmd32 = (int32_t*)(&pld[i]);
+					p_cmd32[0] = th1_i32;
+					i += sizeof(int32_t);
+					p_cmd32[1] = th2_i32;
+					i += sizeof(int32_t);
+
+					int chkidx = (i + (i % 2)) / 2;	//pad a +1 byte if it's odd, divide by 2, set that as the start of our 16bit checksum
+					pu16[chkidx] = fletchers_checksum16(pu16, chkidx);
+					chkidx++;
+					int pld_size = chkidx * sizeof(uint16_t);
+					int stuffed_size = PPP_stuff(pld, pld_size, gl_ppp_stuffing_buffer, sizeof(gl_ppp_stuffing_buffer));
+					//sendto(client.s, (const char*)gl_ppp_stuffing_buffer, stuffed_size, 0, (struct sockaddr*)&client.si_other, client.slen);
+					serial_write(gl_ppp_stuffing_buffer, stuffed_size);
+				}
 			}
-			fpoints_lines.clear();
-			points.clear();
-			if (pRenderer != NULL)
-				SDL_DestroyRenderer(pRenderer);
 		}
 	}
-	if(window != NULL)
-	{
-		//Destroy window
-		SDL_DestroyWindow(window);
-	}
+
+	//Destroy window
+	SDL_DestroyWindow(window);
 
 	//Quit SDL subsystems
 	SDL_Quit();
 
+	// closesocket(client.s);
+	// WSACleanup();
 	close_serial();
-
+	printf("Tore everything down, exiting nicely\n");
 	return 0;
 }
